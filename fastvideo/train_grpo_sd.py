@@ -395,8 +395,80 @@ def main(_):
         first_epoch = 0
     import torch.distributed as dist
     global_step = 0
+    
+    # Profiling setup
+    class Profiler:
+        def __init__(self):
+            self.timers = {}
+            self.cuda_events = {}
+            self.use_cuda = torch.cuda.is_available()
+            
+        def start(self, name):
+            if name not in self.timers:
+                self.timers[name] = []
+            if self.use_cuda:
+                if name not in self.cuda_events:
+                    self.cuda_events[name] = {'start': [], 'end': []}
+                start_event = torch.cuda.Event(enable_timing=True)
+                start_event.record()
+                self.cuda_events[name]['start'].append(start_event)
+            self.timers[name].append(time.time())
+            
+        def end(self, name):
+            if self.use_cuda:
+                end_event = torch.cuda.Event(enable_timing=True)
+                end_event.record()
+                self.cuda_events[name]['end'].append(end_event)
+            self.timers[name].append(time.time())
+            
+        def get_stats(self):
+            stats = {}
+            for name in self.timers:
+                if len(self.timers[name]) % 2 == 0:
+                    cpu_times = []
+                    for i in range(0, len(self.timers[name]), 2):
+                        cpu_times.append(self.timers[name][i+1] - self.timers[name][i])
+                    stats[name] = {
+                        'cpu_total': sum(cpu_times),
+                        'cpu_mean': sum(cpu_times) / len(cpu_times) if cpu_times else 0,
+                        'cpu_count': len(cpu_times)
+                    }
+                    if self.use_cuda and name in self.cuda_events:
+                        gpu_times = []
+                        starts = self.cuda_events[name]['start']
+                        ends = self.cuda_events[name]['end']
+                        if len(starts) == len(ends):
+                            torch.cuda.synchronize()
+                            for s, e in zip(starts, ends):
+                                gpu_times.append(s.elapsed_time(e) / 1000.0)  # Convert ms to seconds
+                        stats[name]['gpu_total'] = sum(gpu_times)
+                        stats[name]['gpu_mean'] = sum(gpu_times) / len(gpu_times) if gpu_times else 0
+            return stats
+            
+        def print_stats(self, epoch):
+            stats = self.get_stats()
+            if dist.get_rank() == 0:
+                print(f"\n{'='*60}")
+                print(f"Epoch {epoch} Profiling Results")
+                print(f"{'='*60}")
+                print(f"{'Stage':<30} {'CPU Total (s)':<15} {'CPU Mean (s)':<15} {'GPU Total (s)':<15} {'GPU Mean (s)':<15} {'Count':<10}")
+                print(f"{'-'*60}")
+                for name, stat in sorted(stats.items()):
+                    gpu_total = stat.get('gpu_total', 0)
+                    gpu_mean = stat.get('gpu_mean', 0)
+                    print(f"{name:<30} {stat['cpu_total']:<15.3f} {stat['cpu_mean']:<15.3f} {gpu_total:<15.3f} {gpu_mean:<15.3f} {stat['cpu_count']:<10}")
+                print(f"{'='*60}\n")
+                
+        def reset(self):
+            self.timers = {}
+            self.cuda_events = {}
+    
+    profiler = Profiler()
+    
     for epoch, prompts in enumerate(loader):
         #################### SAMPLING ####################
+        profiler.start('epoch_total')
+        profiler.start('rollout_total')
         pipeline.unet.eval()
         samples = []
 
@@ -421,8 +493,10 @@ def main(_):
 
         batch_size = config.train.batch_size  
         for i in range(0, len(expanded_prompts), batch_size):
+            profiler.start('rollout_batch')
             current_batch = expanded_prompts[i:i+batch_size]
             
+            profiler.start('rollout_tokenize')
             prompt_ids = pipeline.tokenizer(
                 current_batch,
                 return_tensors="pt",
@@ -431,9 +505,12 @@ def main(_):
                 max_length=pipeline.tokenizer.model_max_length
             ).input_ids.to(accelerator.device)
             prompt_embeds = pipeline.text_encoder(prompt_ids)[0]
+            profiler.end('rollout_tokenize')
+            
             if i%config.num_generations == 0:
                 input_latents = global_input_latents.repeat(batch_size,1,1,1).clone()
 
+            profiler.start('rollout_generation')
             with torch.no_grad():
                 with autocast():
                     images, _, latents, log_probs = pipeline_with_logprob(
@@ -446,6 +523,9 @@ def main(_):
                         output_type="pt",
                         latents=input_latents
                     )
+            profiler.end('rollout_generation')
+            
+            profiler.start('rollout_reward')
             rewards = []
             tuwen_rewards = []
             for j, image in enumerate(images):
@@ -473,11 +553,13 @@ def main(_):
                             if hps_score.ndim == 2:
                                 hps_score = hps_score[:,0]
                             rewards.append(hps_score)
+            profiler.end('rollout_reward')
 
+            profiler.start('rollout_postprocess')
             latents = torch.stack(latents, dim=1).detach()     # (4, num_steps+1, ...)
             log_probs = torch.stack(log_probs, dim=1).detach()   # (4, num_steps, ...)
             rewards = torch.cat(rewards, dim=0)  
-            
+            profiler.end('rollout_postprocess')
 
             all_latents.append(latents)
             all_log_probs.append(log_probs)
@@ -485,8 +567,10 @@ def main(_):
             all_prompts_embed.append(prompt_embeds)
 
             torch.cuda.empty_cache()
+            profiler.end('rollout_batch')
 
 
+        profiler.start('rollout_concat')
         all_latents = torch.cat(all_latents, dim=0)
         all_log_probs = torch.cat(all_log_probs, dim=0)
         all_rewards = torch.cat(all_rewards, dim=0).to(torch.float32)
@@ -494,12 +578,14 @@ def main(_):
         timesteps = pipeline.scheduler.timesteps.repeat(
             config.sample.batch_size*config.num_generations, 1
         ) 
+        profiler.end('rollout_concat')
 
         # compute rewards asynchronously
         #rewards = executor.submit(reward_fn, images, prompts, prompt_metadata)
         # yield to to make sure reward computation starts
         time.sleep(0)
 
+        profiler.start('rollout_prepare_samples')
         samples={
                 "prompt_embeds": all_prompts_embed,
                 "timesteps": timesteps[:, :-1],
@@ -512,9 +598,12 @@ def main(_):
                 "log_probs": all_log_probs[:, :-1],
                 "rewards": all_rewards,
             }
+        profiler.end('rollout_prepare_samples')
 
+        profiler.start('rollout_gather_rewards')
         # gather rewards across processes
         all_rewards_world = gather_tensor(all_rewards)
+        profiler.end('rollout_gather_rewards')
 
         # log rewards and images
         accelerator.log(
@@ -534,6 +623,7 @@ def main(_):
 
         #samples = {k: v.cuda() for k, v in samples.items()}  # 假设原始数据在GPU
         #samples = process_samples(samples, config)
+        profiler.start('advantage_computation')
         n = len(samples["rewards"]) // (config.num_generations)
         advantages = torch.zeros_like(samples["rewards"])
 
@@ -547,7 +637,9 @@ def main(_):
         samples["advantages"] = advantages
 
         samples["final_advantages"] = advantages
+        profiler.end('advantage_computation')
         
+        profiler.end('rollout_total')
 
         total_batch_size, num_timesteps = samples["timesteps"].shape
         #assert (
@@ -557,7 +649,9 @@ def main(_):
         #assert num_timesteps == config.sample.num_steps
 
         #################### TRAINING ####################
+        profiler.start('update_total')
         for inner_epoch in range(config.train.num_inner_epochs):
+            profiler.start('update_shuffle')
             # shuffle along time dimension independently for each sample
             perms = torch.stack(
                 [
@@ -570,7 +664,9 @@ def main(_):
                     torch.arange(total_batch_size, device=accelerator.device)[:, None],
                     perms,
                 ]
+            profiler.end('update_shuffle')
 
+            profiler.start('update_rebatch')
             # rebatch for training
             samples_batched = {
                 k: v.reshape(-1, config.train.batch_size, *v.shape[1:])
@@ -581,6 +677,7 @@ def main(_):
             samples_batched = [
                 dict(zip(samples_batched, x)) for x in zip(*samples_batched.values())
             ]
+            profiler.end('update_rebatch')
 
             # train
             pipeline.unet.train()
@@ -591,6 +688,7 @@ def main(_):
                 position=0,
                 disable=not accelerator.is_local_main_process,
             ):
+                profiler.start('update_batch_total')
                 if config.train.cfg:
                     # concat negative prompts to sample prompts to avoid two forward passes
                     embeds = torch.cat(
@@ -606,7 +704,9 @@ def main(_):
                     leave=False,
                     disable=not accelerator.is_local_main_process,
                 ):
+                    profiler.start('update_timestep_total')
                     with accelerator.accumulate(unet):
+                        profiler.start('update_forward')
                         with autocast():
                             if config.train.cfg:
                                 noise_pred = unet(
@@ -635,7 +735,9 @@ def main(_):
                                 eta=config.sample.eta,
                                 prev_sample=sample["next_latents"][:, j],
                             )
+                        profiler.end('update_forward')
 
+                        profiler.start('update_loss')
                         # ppo logic
                         advantages = torch.clamp(
                             sample["final_advantages"],
@@ -650,6 +752,7 @@ def main(_):
                             1.0 + config.train.clip_range,
                         )
                         loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
+                        profiler.end('update_loss')
 
                         # debugging values
                         # John Schulman says that (ratio - 1) - log(ratio) is a better
@@ -668,14 +771,21 @@ def main(_):
                         )
                         info["loss"].append(loss)
 
+                        profiler.start('update_backward')
                         # backward pass
                         accelerator.backward(loss)
+                        profiler.end('update_backward')
+                        
+                        profiler.start('update_optimizer')
                         if accelerator.sync_gradients:
                             accelerator.clip_grad_norm_(
                                 unet.parameters(), config.train.max_grad_norm
                             )
                         optimizer.step()
                         optimizer.zero_grad()
+                        profiler.end('update_optimizer')
+                        
+                    profiler.end('update_timestep_total')
 
                     # Checks if the accelerator has performed an optimization step behind the scenes
                     if accelerator.sync_gradients:
@@ -689,6 +799,7 @@ def main(_):
                         accelerator.log(info, step=global_step)
                         global_step += 1
                         info = defaultdict(list)
+                profiler.end('update_batch_total')
                 if dist.get_rank()%8==0:
                     print("reward", sample["rewards"])
                     print("ratio", ratio)
@@ -700,6 +811,14 @@ def main(_):
 
             # make sure we did an optimization step at the end of the inner epoch
             assert accelerator.sync_gradients
+        
+        profiler.end('update_total')
+        profiler.end('epoch_total')
+        
+        # Print profiling results
+        if epoch % max(1, config.save_freq // 2) == 0 or epoch == 0:
+            profiler.print_stats(epoch)
+            profiler.reset()
 
         if epoch != 0 and epoch % config.save_freq == 0: # 
         #if epoch % config.save_freq == 0: 
