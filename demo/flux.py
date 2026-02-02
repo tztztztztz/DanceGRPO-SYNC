@@ -14,4 +14,5 @@ image = pipe(
     max_sequence_length=512,
     generator=torch.Generator("cpu").manual_seed(0)
 ).images[0]
+
 image.save("flux-dev.png")
