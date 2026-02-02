@@ -182,6 +182,7 @@ def sample_reference_model(
     encoder_attention_mask,
     inferencer,
     caption,
+    profiler=None,
 ):
     w, h, t = args.w, args.h, args.t
     sample_steps = args.sampling_steps
@@ -216,6 +217,8 @@ def sample_reference_model(
                 dtype=torch.bfloat16,
             )
     for index, batch_idx in enumerate(batch_indices):
+        if profiler is not None:
+            profiler.start('rollout_batch')
         batch_encoder_hidden_states = encoder_hidden_states[batch_idx]
         batch_encoder_attention_mask = encoder_attention_mask[batch_idx]
         batch_caption = [caption[i] for i in batch_idx]
@@ -229,6 +232,8 @@ def sample_reference_model(
             )
         grpo_sample=True
         progress_bar = tqdm(range(0, sample_steps), desc="Sampling Progress")
+        if profiler is not None:
+            profiler.start('rollout_sampling')
         with torch.no_grad():
             z, latents, batch_latents, batch_log_probs = run_sample_step(
                 args,
@@ -240,12 +245,16 @@ def sample_reference_model(
                 batch_encoder_attention_mask,
                 grpo_sample,
             )
+        if profiler is not None:
+            profiler.end('rollout_sampling')
         
         # 累积所有批次的latents和log_probs
         all_latents.append(batch_latents)
         all_log_probs.append(batch_log_probs)
         vae.enable_tiling()
         
+        if profiler is not None:
+            profiler.start('rollout_vae_decode')
         video_processor = VideoProcessor(
             vae_scale_factor=8)
         
@@ -253,11 +262,20 @@ def sample_reference_model(
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 video = vae.decode(latents, return_dict=False)[0]
                 videos = video_processor.postprocess_video(video)
+        if profiler is not None:
+            profiler.end('rollout_vae_decode')
+        
         rank = int(os.environ["RANK"])
         from diffusers.utils import export_to_video
         
+        if profiler is not None:
+            profiler.start('rollout_export_video')
         export_to_video(videos[0], f"./videos/hunyuan_{rank}_{index}.mp4", fps=args.fps)
+        if profiler is not None:
+            profiler.end('rollout_export_video')
         if args.use_videoalign:
+            if profiler is not None:
+                profiler.start('rollout_reward')
             try:
                 with torch.no_grad():
                     absolute_path = os.path.abspath(f"./videos/hunyuan_{rank}_{index}.mp4")
@@ -276,6 +294,10 @@ def sample_reference_model(
                 all_vq_rewards.append(vq_reward.unsqueeze(0))
                 mq_reward = torch.tensor(-1.0).to(device)
                 all_mq_rewards.append(mq_reward.unsqueeze(0))
+            if profiler is not None:
+                profiler.end('rollout_reward')
+        if profiler is not None:
+            profiler.end('rollout_batch')
 
     all_latents = torch.cat(all_latents, dim=0)
     all_log_probs = torch.cat(all_log_probs, dim=0)
@@ -303,15 +325,26 @@ def train_one_step(
     loader,
     max_grad_norm,
     step,
+    profiler=None,
 ):
     total_loss = 0.0
+    if profiler is not None:
+        profiler.start('step_total')
     optimizer.zero_grad()
+    if profiler is not None:
+        profiler.start('data_loading')
     (
         encoder_hidden_states,
         encoder_attention_mask,
         caption,
     ) = next(loader)
+    if profiler is not None:
+        profiler.end('data_loading')
+    if profiler is not None:
+        profiler.start('rollout_total')
     if args.use_group:
+        if profiler is not None:
+            profiler.start('rollout_expand_prompts')
         def repeat_tensor(tensor):
             if tensor is None:
                 return None
@@ -326,6 +359,8 @@ def train_one_step(
             caption = [item for item in caption for _ in range(args.num_generations)]
         else:
             raise ValueError(f"Unsupported caption type: {type(caption)}")
+        if profiler is not None:
+            profiler.end('rollout_expand_prompts')
         
     videos, latents, vq_reward, mq_reward, all_latents, all_log_probs, sigma_schedule = sample_reference_model(
             args,
@@ -337,7 +372,12 @@ def train_one_step(
             encoder_attention_mask, 
             inferencer,
             caption,
+            profiler=profiler,
         )
+    if profiler is not None:
+        profiler.end('rollout_total')
+    if profiler is not None:
+        profiler.start('postprocess_samples')
     batch_size = all_latents.shape[0]
     timestep_value = [int(sigma * 1000) for sigma in sigma_schedule][:args.sampling_steps]
     timestep_values = [timestep_value[:] for _ in range(batch_size)]
@@ -357,8 +397,12 @@ def train_one_step(
         "encoder_hidden_states": encoder_hidden_states,
         "encoder_attention_mask": encoder_attention_mask,
     }
+    if profiler is not None:
+        profiler.start('gather_rewards')
     gathered_vq_reward = gather_tensor(samples["vq_rewards"])
     gathered_mq_reward = gather_tensor(samples["mq_rewards"])
+    if profiler is not None:
+        profiler.end('gather_rewards')
     if dist.get_rank()==0:
         print("gathered_vq_reward", gathered_vq_reward)
         with open('./vq_reward.txt', 'a') as f:  
@@ -367,6 +411,8 @@ def train_one_step(
         with open('./mq_reward.txt', 'a') as f:  
             f.write(f"{gathered_mq_reward.mean().item()}\n")
 
+    if profiler is not None:
+        profiler.start('advantage_computation')
     n = len(samples["vq_rewards"]) // (args.num_generations)
     vq_advantages = torch.zeros_like(samples["vq_rewards"])
     mq_advantages = torch.zeros_like(samples["mq_rewards"])
@@ -390,7 +436,11 @@ def train_one_step(
         mq_advantages[start_idx:end_idx] = (group_rewards - group_mean) / group_std
     
     samples["mq_advantages"] = mq_advantages
+    if profiler is not None:
+        profiler.end('advantage_computation')
 
+    if profiler is not None:
+        profiler.start('bestofn_selection')
     # best-of-n
     total_scores = args.vq_coef * samples["vq_advantages"] + args.mq_coef * samples["mq_advantages"]
 
@@ -407,7 +457,11 @@ def train_one_step(
         for key in samples:
             samples[key] = samples[key][selected_indices]
         batch_size = len(selected_indices)
+    if profiler is not None:
+        profiler.end('bestofn_selection')
     
+    if profiler is not None:
+        profiler.start('update_shuffle')
     perms = torch.stack(
         [
             torch.randperm(len(samples["timesteps"][0]))
@@ -419,6 +473,11 @@ def train_one_step(
             torch.arange(batch_size).to(device) [:, None],
             perms,
         ]
+    if profiler is not None:
+        profiler.end('update_shuffle')
+    
+    if profiler is not None:
+        profiler.start('update_rebatch')
     samples_batched = {
         k: v.unsqueeze(1)
         for k, v in samples.items()
@@ -427,12 +486,20 @@ def train_one_step(
     samples_batched_list = [
         dict(zip(samples_batched, x)) for x in zip(*samples_batched.values())
     ]
+    if profiler is not None:
+        profiler.end('update_rebatch')
+    if profiler is not None:
+        profiler.end('postprocess_samples')
 
+    if profiler is not None:
+        profiler.start('update_total')
     train_timesteps = int(len(samples["timesteps"][0])*args.timestep_fraction)
     for i,sample in list(enumerate(samples_batched_list)):
         for _ in range(train_timesteps):
             clip_range = 1e-4
             adv_clip_max = 5.0
+            if profiler is not None:
+                profiler.start('update_forward')
             new_log_probs = grpo_one_step(
                 args,
                 sample["latents"][:,_],
@@ -444,6 +511,11 @@ def train_one_step(
                 perms[i][_],
                 sigma_schedule,
             )
+            if profiler is not None:
+                profiler.end('update_forward')
+            
+            if profiler is not None:
+                profiler.start('update_loss')
             ratio = torch.exp(new_log_probs - sample["log_probs"][:,_])
 
 
@@ -475,16 +547,30 @@ def train_one_step(
             mq_loss = torch.mean(torch.maximum(mq_unclipped_loss, mq_clipped_loss)) / (args.gradient_accumulation_steps * train_timesteps)
             
             final_loss = args.vq_coef*vq_loss + args.mq_coef*mq_loss
+            if profiler is not None:
+                profiler.end('update_loss')
             
+            if profiler is not None:
+                profiler.start('update_backward')
             final_loss.backward()
+            if profiler is not None:
+                profiler.end('update_backward')
             avg_loss = final_loss.detach().clone()
             dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
             total_loss += avg_loss.item()
         if (i+1)%args.gradient_accumulation_steps==0:
+            if profiler is not None:
+                profiler.start('update_optimizer')
             grad_norm = transformer.clip_grad_norm_(max_grad_norm)
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
+            if profiler is not None:
+                profiler.end('update_optimizer')
+    if profiler is not None:
+        profiler.end('update_total')
+    if profiler is not None:
+        profiler.end('step_total')
         if dist.get_rank()%8==0:
             print("vq loss/mq loss", vq_loss.item(), mq_loss.item())
             print("vq/mq reward", sample["vq_rewards"].item(), sample["mq_rewards"].item())
@@ -658,6 +744,51 @@ def main(args):
 
     step_times = deque(maxlen=100)
 
+    # Profiling setup
+    class Profiler:
+        def __init__(self):
+            self.timers = {}
+            
+        def start(self, name):
+            if name not in self.timers:
+                self.timers[name] = []
+            self.timers[name].append(time.time())
+            
+        def end(self, name):
+            if name in self.timers:
+                self.timers[name].append(time.time())
+            
+        def get_stats(self):
+            stats = {}
+            for name in self.timers:
+                if len(self.timers[name]) % 2 == 0:
+                    times = []
+                    for i in range(0, len(self.timers[name]), 2):
+                        times.append(self.timers[name][i+1] - self.timers[name][i])
+                    stats[name] = {
+                        'total': sum(times),
+                        'mean': sum(times) / len(times) if times else 0,
+                        'count': len(times)
+                    }
+            return stats
+            
+        def print_stats(self, step):
+            stats = self.get_stats()
+            if dist.get_rank() == 0:
+                print(f"\n{'='*60}")
+                print(f"Step {step} Profiling Results")
+                print(f"{'='*60}")
+                print(f"{'Stage':<35} {'Total (s)':<15} {'Mean (s)':<15} {'Count':<10}")
+                print(f"{'-'*60}")
+                for name, stat in sorted(stats.items()):
+                    print(f"{name:<35} {stat['total']:<15.3f} {stat['mean']:<15.3f} {stat['count']:<10}")
+                print(f"{'='*60}\n")
+                
+        def reset(self):
+            self.timers = {}
+    
+    profiler = Profiler()
+
     # todo future
     for epoch in range(1):
         if isinstance(sampler, DistributedSampler):
@@ -680,11 +811,17 @@ def main(args):
                 loader,
                 args.max_grad_norm,
                 step,
+                profiler=profiler,
             )
     
             step_time = time.time() - start_time
             step_times.append(step_time)
             avg_step_time = sum(step_times) / len(step_times)
+    
+            # Print profiling results periodically
+            if step % max(1, args.checkpointing_steps // 2) == 0 or step == init_steps + 1:
+                profiler.print_stats(step)
+                profiler.reset()
     
             progress_bar.set_postfix(
                 {
